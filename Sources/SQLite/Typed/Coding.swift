@@ -131,11 +131,17 @@ fileprivate class SQLiteEncoder: Encoder {
         func encode<T>(_ value: T, forKey key: Key) throws where T : Swift.Encodable {
             if let data = value as? Data {
                 self.encoder.setters.append(Expression(key.stringValue) <- data)
-            }
-            else {
-                let encoded = try JSONEncoder().encode(value)
-                let string = String(data: encoded, encoding: .utf8)
-                self.encoder.setters.append(Expression(key.stringValue) <- string)
+            } else if let url = value as? URL {
+                encoder.codingPath = [key]
+                try url.absoluteString.encode(to: encoder)
+            } else {
+                do {
+                    encoder.codingPath = [key]
+                    try value.encode(to: encoder)
+                } catch {
+                    let encoded = try JSONEncoder().encode(value)
+                    self.encoder.setters.append(Expression(key.stringValue) <- encoded)
+                }
             }
         }
 
@@ -184,8 +190,53 @@ fileprivate class SQLiteEncoder: Encoder {
         }
     }
 
+    class SingleSQLiteValueEncodingContainer: SingleValueEncodingContainer {
+        var codingPath: [CodingKey] = []
+
+        let encoder: SQLiteEncoder
+
+        init(encoder: SQLiteEncoder) {
+            self.encoder = encoder
+        }
+
+        private func codingKey() throws -> String {
+            guard let key = encoder.codingPath.last?.stringValue else {
+                fatalError("SingleSQLiteValueEncodingContainer is missing a codingPath")
+            }
+            return key
+        }
+
+        func encodeNil() throws {
+            encoder.setters.append(Expression(value: try codingKey()) <- nil)
+        }
+
+        func encode(_ value: Int) throws {
+            encoder.setters.append(Expression(try codingKey()) <- value)
+        }
+
+        func encode(_ value: Bool) throws {
+            encoder.setters.append(Expression(try codingKey()) <- value)
+        }
+
+        func encode(_ value: Float) throws {
+            encoder.setters.append(Expression(try codingKey()) <- Double(value))
+        }
+
+        func encode(_ value: Double) throws {
+            encoder.setters.append(Expression<Double>(try codingKey()) <- value)
+        }
+
+        func encode(_ value: String) throws {
+            encoder.setters.append(Expression(try codingKey()) <- value)
+        }
+
+        func encode<T>(_ value: T) throws where T: Encodable {
+            fatalError("not supported")
+        }
+    }
+
     fileprivate var setters: [Setter] = []
-    let codingPath: [CodingKey] = []
+    var codingPath: [CodingKey] = []
     let userInfo: [CodingUserInfoKey: Any]
 
     init(userInfo: [CodingUserInfoKey: Any]) {
@@ -193,7 +244,7 @@ fileprivate class SQLiteEncoder: Encoder {
     }
 
     func singleValueContainer() -> SingleValueEncodingContainer {
-        fatalError("not supported")
+        SingleSQLiteValueEncodingContainer(encoder: self)
     }
 
     func unkeyedContainer() -> UnkeyedEncodingContainer {
@@ -293,10 +344,17 @@ fileprivate class SQLiteDecoder : Decoder {
             guard let JSONString = try self.row.get(Expression<String?>(key.stringValue)) else {
                 throw DecodingError.typeMismatch(type, DecodingError.Context(codingPath: self.codingPath, debugDescription: "an unsupported type was found"))
             }
-            guard let data = JSONString.data(using: .utf8) else {
+            guard let data = "\(JSONString)".data(using: .utf8) else {
                 throw DecodingError.dataCorrupted(DecodingError.Context(codingPath: self.codingPath, debugDescription: "invalid utf8 data found"))
             }
-            return try JSONDecoder().decode(type, from: data)
+            guard let dataQuoted = "\"\(JSONString)\"".data(using: .utf8) else {
+                throw DecodingError.dataCorrupted(DecodingError.Context(codingPath: self.codingPath, debugDescription: "invalid utf8 data found"))
+            }
+            do {
+                return try JSONDecoder().decode(type, from: data)
+            } catch {
+                return try JSONDecoder().decode(type, from: dataQuoted)
+            }
         }
 
         func nestedContainer<NestedKey>(keyedBy type: NestedKey.Type, forKey key: Key) throws -> KeyedDecodingContainer<NestedKey> where NestedKey : CodingKey {
